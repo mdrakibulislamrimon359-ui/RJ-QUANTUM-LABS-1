@@ -49,16 +49,8 @@ client = genai.Client(
 # GEMINI MODELS
 # =========================================================
 #
-# একটার সমস্যা হলে পরেরটায় যাবে।
-#
-# Primary:
-# 3.8 Flash
-#
-# Fallback:
-# 3.7 Flash
-# 3.6 Flash
-# 2.5 Flash
-# 3.5 Flash-Lite
+# Primary model আগে চেষ্টা করবে।
+# সমস্যা হলে fallback model-এ যাবে।
 #
 # =========================================================
 
@@ -73,12 +65,6 @@ GEMINI_MODELS = [
 
 # =========================================================
 # REQUEST CONTROL
-# =========================================================
-#
-# একই সময়ে সর্বোচ্চ 3টি Gemini request।
-#
-# এতে অনেক user একসাথে SMS পাঠালে চাপ কমে।
-#
 # =========================================================
 
 GEMINI_SEMAPHORE = asyncio.Semaphore(3)
@@ -193,21 +179,41 @@ RULES:
 
 
 # =========================================================
-# TRANSIENT ERROR CHECK
+# ERROR TYPE CHECK
 # =========================================================
 
-def is_transient_error(error_text: str) -> bool:
+def get_error_type(error_text: str):
 
     text = error_text.lower()
 
-    patterns = [
+    # -----------------------------------------------------
+    # QUOTA / RATE LIMIT
+    # -----------------------------------------------------
+
+    quota_patterns = [
         "429",
+        "resource_exhausted",
+        "quota exceeded",
+        "generate_content_free_tier_requests",
+        "rate limit",
+        "too many requests",
+    ]
+
+    if any(
+        pattern in text
+        for pattern in quota_patterns
+    ):
+        return "quota"
+
+    # -----------------------------------------------------
+    # TEMPORARY SERVER ERROR
+    # -----------------------------------------------------
+
+    transient_patterns = [
         "500",
         "502",
         "503",
         "504",
-        "resource_exhausted",
-        "unavailable",
         "service unavailable",
         "internal server error",
         "bad gateway",
@@ -215,14 +221,34 @@ def is_transient_error(error_text: str) -> bool:
         "high demand",
         "temporarily unavailable",
         "timeout",
-        "rate limit",
-        "too many requests",
     ]
 
-    return any(
+    if any(
         pattern in text
-        for pattern in patterns
-    )
+        for pattern in transient_patterns
+    ):
+        return "transient"
+
+    # -----------------------------------------------------
+    # MODEL NOT AVAILABLE
+    # -----------------------------------------------------
+
+    unavailable_patterns = [
+        "404",
+        "not_found",
+        "not found",
+        "model is not available",
+        "model is unavailable",
+        "no longer available",
+    ]
+
+    if any(
+        pattern in text
+        for pattern in unavailable_patterns
+    ):
+        return "unavailable"
+
+    return "other"
 
 
 # =========================================================
@@ -236,24 +262,23 @@ async def generate_gemini(
 
     async with GEMINI_SEMAPHORE:
 
+        quota_failed_models = []
+        temporary_failed_models = []
+
         # -------------------------------------------------
-        # প্রতিটি model একবার করে চেষ্টা করবে।
-        # Transient error হলে প্রয়োজনে retry করবে।
+        # প্রতিটি model একবার করে চেষ্টা
         # -------------------------------------------------
 
         for model_index, model_name in enumerate(
             GEMINI_MODELS
         ):
 
-            # Primary model:
-            # দ্রুত fallback করার জন্য 1 retry
-            #
-            # অন্য model:
-            # 2 attempt
-            #
-            max_attempts = (
-                1 if model_index == 0 else 2
-            )
+            # -------------------------------------------------
+            # প্রথম model-এ 1 attempt
+            # fallback model-এও unnecessary retry কমানো হয়েছে
+            # -------------------------------------------------
+
+            max_attempts = 1
 
             for attempt in range(
                 1,
@@ -269,11 +294,6 @@ async def generate_gemini(
                         attempt,
                         max_attempts,
                     )
-
-                    # -------------------------------------------------
-                    # AFC সম্পূর্ণ বন্ধ
-                    # এই bot-এ function/tool দরকার নেই।
-                    # -------------------------------------------------
 
                     config = types.GenerateContentConfig(
                         system_instruction=system_instruction,
@@ -298,7 +318,7 @@ async def generate_gemini(
                     ).strip()
 
                     # -------------------------------------------------
-                    # Empty response
+                    # SUCCESS
                     # -------------------------------------------------
 
                     if answer:
@@ -315,101 +335,143 @@ async def generate_gemini(
                         model_name,
                     )
 
-                    # Empty হলে পরের model
                     break
 
                 except Exception as e:
 
                     error_text = str(e)
 
+                    error_type = get_error_type(
+                        error_text
+                    )
+
                     logger.error(
                         "Gemini error | "
                         "model=%s | "
+                        "type=%s | "
                         "attempt=%s/%s | %s",
                         model_name,
+                        error_type,
                         attempt,
                         max_attempts,
                         error_text,
                     )
 
                     # =================================================
-                    # TRANSIENT ERROR
+                    # QUOTA ERROR
                     # =================================================
 
-                    if is_transient_error(
-                        error_text
-                    ):
+                    if error_type == "quota":
+
+                        quota_failed_models.append(
+                            model_name
+                        )
+
+                        logger.warning(
+                            "Quota exhausted | "
+                            "model=%s | "
+                            "trying next model",
+                            model_name,
+                        )
 
                         # -------------------------------------------------
-                        # শেষ attempt না হলে retry
+                        # QUOTA ERROR হলে অপেক্ষা না করে সরাসরি next model
                         # -------------------------------------------------
 
-                        if attempt < max_attempts:
+                        break
 
-                            # Exponential backoff:
-                            #
-                            # 1st retry ≈ 2 sec
-                            # 2nd retry ≈ 4 sec
-                            #
-                            base_wait = (
-                                2 ** attempt
-                            )
+                    # =================================================
+                    # TEMPORARY ERROR
+                    # =================================================
 
-                            jitter = random.uniform(
-                                0.2,
-                                0.8,
-                            )
+                    if error_type == "transient":
+
+                        temporary_failed_models.append(
+                            model_name
+                        )
+
+                        logger.warning(
+                            "Temporary Gemini error | "
+                            "model=%s",
+                            model_name,
+                        )
+
+                        # -------------------------------------------------
+                        # শুধু temporary error হলে ছোট delay
+                        # -------------------------------------------------
+
+                        if model_index < len(
+                            GEMINI_MODELS
+                        ) - 1:
 
                             wait_time = (
-                                base_wait + jitter
-                            )
-
-                            logger.warning(
-                                "Transient Gemini error. "
-                                "Retrying model=%s in %.1f seconds...",
-                                model_name,
-                                wait_time,
+                                random.uniform(
+                                    1.0,
+                                    2.5,
+                                )
                             )
 
                             await asyncio.sleep(
                                 wait_time
                             )
 
-                            continue
+                        break
 
-                        # -------------------------------------------------
-                        # এই model unavailable।
-                        # পরের model-এ যাবে।
-                        # -------------------------------------------------
+                    # =================================================
+                    # MODEL UNAVAILABLE
+                    # =================================================
+
+                    if error_type == "unavailable":
 
                         logger.warning(
-                            "Model %s unavailable. "
-                            "Trying next model...",
+                            "Model unavailable | "
+                            "model=%s | "
+                            "trying next model",
                             model_name,
                         )
 
                         break
 
                     # =================================================
-                    # NON-TRANSIENT ERROR
+                    # OTHER ERROR
                     # =================================================
 
                     logger.warning(
-                        "Non-transient Gemini error. "
-                        "Trying next model..."
+                        "Unknown Gemini error | "
+                        "model=%s | "
+                        "trying next model",
+                        model_name,
                     )
 
                     break
 
-    # =========================================================
-    # ALL MODELS FAILED
-    # =========================================================
+        # =========================================================
+        # ALL MODELS FAILED
+        # =========================================================
 
-    logger.error(
-        "ALL GEMINI MODELS FAILED."
-    )
+        logger.error(
+            "ALL GEMINI MODELS FAILED | "
+            "quota_models=%s | temporary_models=%s",
+            quota_failed_models,
+            temporary_failed_models,
+        )
 
-    return None
+        # ---------------------------------------------------------
+        # যদি সব model quota exhausted হয়
+        # ---------------------------------------------------------
+
+        if (
+            len(quota_failed_models)
+            == len(GEMINI_MODELS)
+        ):
+
+            return "__GEMINI_QUOTA_EXHAUSTED__"
+
+        # ---------------------------------------------------------
+        # অন্য কোনো সমস্যা
+        # ---------------------------------------------------------
+
+        return None
 
 
 # =========================================================
@@ -535,10 +597,25 @@ async def ai_reply(
         system_instruction=SYSTEM_PROMPT,
     )
 
+    # -----------------------------------------------------
+    # QUOTA EXHAUSTED
+    # -----------------------------------------------------
+
+    if answer == "__GEMINI_QUOTA_EXHAUSTED__":
+
+        return (
+            "⚠️ এই মুহূর্তে AI-এর দৈনিক API quota শেষ হয়ে গেছে।\n\n"
+            "কিছু সময় পরে আবার চেষ্টা করুন। ❤️"
+        )
+
+    # -----------------------------------------------------
+    # OTHER ERROR
+    # -----------------------------------------------------
+
     if not answer:
 
         return (
-            "😅 এই মুহূর্তে AI সার্ভারগুলো ব্যস্ত আছে।\n\n"
+            "😅 এই মুহূর্তে AI সার্ভার ব্যস্ত আছে।\n\n"
             "একটু পরে আবার SMS পাঠাও। ❤️"
         )
 
@@ -580,6 +657,13 @@ Text:
             "Return only the requested translation."
         ),
     )
+
+    if result == "__GEMINI_QUOTA_EXHAUSTED__":
+
+        return (
+            "⚠️ Gemini API quota শেষ হয়ে গেছে।\n"
+            "কিছু সময় পরে আবার চেষ্টা করুন।"
+        )
 
     if not result:
 
